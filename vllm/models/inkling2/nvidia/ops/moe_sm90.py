@@ -17,11 +17,13 @@ import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .activation import _situ
 from .linear import k_group_partials
 from .moe import _load_bias, _local_experts, _select_experts
+from .moe_align_triton import moe_align_block_size as triton_moe_align_block_size
 
 if TYPE_CHECKING:
     from vllm.utils.humming import HummingInputSchema
@@ -300,10 +302,13 @@ class HummingExperts:
         # Expected local rows, which pick the kernel configs.
         valid_rows = -(-rows * self.num_experts // num_global_experts)
         block_m = {name: self._block_m(name, valid_rows) for name in ("w13", "w2")}
+        align = (
+            triton_moe_align_block_size
+            if current_platform.is_device_capability_family(110) and rows <= 256
+            else moe_align_block_size
+        )
         alignments = {
-            size: moe_align_block_size(
-                ids, size, self.num_experts, ignore_invalid_experts=True
-            )[:3]
+            size: align(ids, size, self.num_experts, ignore_invalid_experts=True)[:3]
             for size in set(block_m.values())
         }
         gate_up = self._gemm(

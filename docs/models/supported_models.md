@@ -776,6 +776,13 @@ Some models are supported only via the [Transformers modeling backend](#transfor
     `meta-models/Muse-Glimmer-30B-assistant` checkpoint, which vLLM serves through
     its [DFlash](../features/speculative_decoding/README.md) path.
 
+!!! note "Inkling 2 on Jetson AGX Thor"
+    On SM110, Inkling 2's Humming expert backend automatically groups small
+    decode batches (up to 256 routed rows) with JIT-compiled Triton kernels.
+    Larger batches keep native alignment. The grouping
+    preserves route order, excludes invalid expert IDs, and supports CUDA graphs;
+    no additional launch option is needed. Other GPU families keep native alignment.
+
 !!! note
     Both Nemotron Nano architecture names and `NemotronH_Omni_Reasoning_V3` map to
     the same vLLM implementation.

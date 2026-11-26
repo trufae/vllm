@@ -13,6 +13,7 @@ if not (
     current_platform.is_device_capability_family(100)
     or current_platform.is_device_capability(90)
     or current_platform.is_device_capability_family(120)
+    or current_platform.is_device_capability_family(110)
 ):
     pytest.skip("Inkling2 MoE requires Hopper or Blackwell", allow_module_level=True)
 
@@ -31,6 +32,9 @@ from vllm.models.inkling2.nvidia.ops.block_scales import (  # noqa: E402
     swizzle_block_scales,
 )
 from vllm.models.inkling2.nvidia.ops.linear import linear_k_groups  # noqa: E402
+from vllm.models.inkling2.nvidia.ops.moe_align_triton import (  # noqa: E402
+    moe_align_block_size as triton_moe_align_block_size,
+)
 from vllm.models.inkling2.nvidia.ops.moe_sm90 import (  # noqa: E402
     HummingExperts,
     select_experts,
@@ -41,6 +45,50 @@ from vllm.models.inkling2.nvidia.ops.trtllm_bmm import ExpertPlan  # noqa: E402
 from vllm.triton_utils import tl, triton  # noqa: E402
 
 E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
+
+
+@pytest.mark.parametrize("rows", [0, 8, 64, 256])
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_humming_triton_alignment_preserves_routes_and_padding(rows, block_size):
+    """Preserve flattened route order and exclude non-local/padded experts."""
+    generator = torch.Generator().manual_seed(110)
+    ids = torch.randint(-2, 130, (rows,), generator=generator).to("cuda")
+    flat = ids.cpu().tolist()
+    expected_rows, expected_experts = [], []
+    for expert in range(128):
+        group = [i for i, value in enumerate(flat) if value == expert]
+        if group:
+            padded = -(-len(group) // block_size) * block_size
+            expected_rows.extend(group + [rows] * (padded - len(group)))
+            expected_experts.extend([expert] * (padded // block_size))
+    sorted_ids, expert_ids, total = triton_moe_align_block_size(
+        ids, block_size, 128, ignore_invalid_experts=True
+    )
+    assert total.item() == len(expected_rows)
+    assert sorted_ids[: len(expected_rows)].cpu().tolist() == expected_rows
+    assert expert_ids[: len(expected_experts)].cpu().tolist() == expected_experts
+    assert (sorted_ids[len(expected_rows) :] == rows).all()
+    assert (expert_ids[len(expected_experts) :] == -1).all()
+
+
+@pytest.mark.parametrize("rows", [64, 256])
+def test_humming_triton_alignment_replays_new_expert_counts(rows):
+    """Replay must reinitialize padding when the active expert set changes."""
+    ids = torch.arange(rows, dtype=torch.int32, device="cuda") % 128
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        triton_moe_align_block_size(ids, 64, 128, True)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = triton_moe_align_block_size(ids, 64, 128, True)
+    for expert in (-1, 0, 127, 128):
+        ids.fill_(expert)
+        graph.replay()
+        expected = triton_moe_align_block_size(ids, 64, 128, True)
+        for got, want in zip(actual, expected):
+            torch.testing.assert_close(got, want, atol=0, rtol=0)
 
 
 def dequant_nvfp4(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
